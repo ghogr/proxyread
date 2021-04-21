@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+
+# This tool reads proxy configuaration from desktop environments such as gnome
+# or KDE, and simply returns it as-is, for use in command line arguments. This is
+# written to avoid hard-coding proxy configuration in .desktop files as much as possible
+
+# v0.1: initial version
+
+debug_echo() {
+    if [[ $DEBUG == "1" ]]; then
+        echo "$1"
+    fi
+}
+
+print_help() {
+    echo "proxyread: prints proxy configuration from desktop environments."
+    echo
+    echo "Usage: $(basename $0) -p PROTOCOL [options]"
+    echo
+    echo "  -h  Print this help message."
+    echo "  -p  Protocol: [http, https, ftp, socks]"
+    echo "  -s  SOCKS protocol version: [4, 4h, 5, 5h]"
+    echo "      Optional, only works when -p is socks."
+    echo "      The versions with h implies remote DNS resolution and has limited support."
+    echo "      Will return 'socks' as protocol if unspecified, which is not usually what you need."
+    echo "  -v  Verbose, for debugging only"
+}
+
+# check dektop environment
+if [[ $XDG_CURRENT_DESKTOP == "GNOME" ]]; then
+    SETTINGS_BACKEND=gsettings
+elif [[ $XDG_CURRENT_DESKTOP == "KDE" ]]; then
+    SETTINGS_BACKEND=kreadconfig
+else
+    if [[ $TERM == "dumb" ]]; then
+        # try to send a desktop notification since the $TERM is dumb
+        notify-send --app-name proxyread "Unsupported desktop environment: $XDG_CURRENT_DESKTOP."
+    else
+        echo "Unsupported desktop environment: $XDG_CURRENT_DESKTOP."
+    fi
+    exit 1
+fi
+
+# Print help and exit if invoked without any args.
+if [[ $# == 0 ]]; then
+    echo "No argument provided."
+    print_help
+    exit
+fi
+
+while getopts "hp:s:v" OPTION; do
+    case $OPTION in
+    h)
+        print_help
+        exit
+        ;;
+    p)
+        PROTOCOL=$OPTARG
+        ;;
+    s)
+        SOCKSVER=$OPTARG
+        ;;
+    v)
+        DEBUG=1
+        ;;
+    *)
+        print_help
+        exit 1
+        ;;
+    esac
+done
+
+debug_echo "Detected Desktop Environment: $XDG_CURRENT_DESKTOP"
+debug_echo "Using Settings Backend: $SETTINGS_BACKEND"
+
+# Protocol sanity checks
+case $PROTOCOL in
+http | https | ftp | socks)
+    debug_echo "Protocol: $PROTOCOL"
+    ;;
+*)
+    echo "$PROTOCOL is not a supported protocol."
+    exit 1
+    ;;
+esac
+
+if [[ $PROTOCOL != "socks" && $SOCKSVER != "" ]]; then
+    echo "Do not specify socks version for other protocols."
+    exit 1
+fi
+
+# If not socks then FINAL_PROTOCOL is the input PROTOCOL
+if [[ $PROTOCOL != "socks" ]]; then
+    case $PROTOCOL in
+    http | ftp)
+        FINAL_PROTOCOL=$PROTOCOL
+        ;;
+    https)
+        FINAL_PROTOCOL="http"
+        debug_echo "Using 'http' as protocol for HTTPS!"
+        ;;
+    esac
+fi
+
+# socks-specific checks
+if [[ $PROTOCOL == "socks" ]]; then
+    case $SOCKSVER in
+    4 | 4h | 5 | 5h)
+        debug_echo "SOCKS version: $SOCKSVER"
+        FINAL_PROTOCOL="socks$SOCKSVER"
+        ;;
+    "")
+        debug_echo "SOCKS version undefined. Using 'socks'."
+        FINAL_PROTOCOL=$PROTOCOL
+        ;;
+    *)
+        echo "$SOCKSVER is not a supported socks version."
+        exit 1
+        ;;
+    esac
+fi
+
+# read settings
+case $SETTINGS_BACKEND in
+gsettings)
+    if [[ $(gsettings get org.gnome.system.proxy mode) != "'manual'" ]]; then
+        echo "Proxy is not enabled in gsettings!"
+        exit 1
+    fi
+    HOST=$(gsettings get org.gnome.system.proxy.$PROTOCOL host | awk '{print substr($1,2,length($1)-2)}')
+    PORT=$(gsettings get org.gnome.system.proxy.$PROTOCOL port)
+    ;;
+kreadconfig)
+    if [[ $(
+        kreadconfig5 --file kioslaverc --group "Proxy Settings" --key "ProxyType"
+    ) != "1" ]]; then
+        echo "ProxyType is incorrect in kioslaverc!"
+        exit 1
+    fi
+    debug_echo "Note: this tool does not respect the protocol set in KDE's settings. Only hostname and port will be used."
+    KDECONFIG=$(kreadconfig5 --file kioslaverc --group "Proxy Settings" --key $PROTOCOL"Proxy")
+    HOST=$(echo $KDECONFIG | awk '{print $1}' | awk -F// '{print $NF}')
+    PORT=$(echo $KDECONFIG | awk '{print $2}')
+    ;;
+esac
+
+debug_echo "--------------------"
+debug_echo "Final results:"
+debug_echo "FINAL_PROTOCOL: $FINAL_PROTOCOL"
+debug_echo "HOST: $HOST"
+debug_echo "PORT: $PORT"
+debug_echo "Final output:"
+
+# final output
+printf "$FINAL_PROTOCOL://$HOST:$PORT"
